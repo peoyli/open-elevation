@@ -90,8 +90,9 @@ The following are instructions for Ubuntu/Debian compatible distros, and similar
 	
 
 ```
-apt-get update -y
-apt-get install -y libspatialindex-dev unrar-free bc
+apt update -y
+apt install -y libspatialindex-dev unrar-free bc
+apt install -y python3-pip wget gdal-bin libgdal-dev
 pip install -r requirements.txt
 ```
 
