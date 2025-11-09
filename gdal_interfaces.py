@@ -119,7 +119,12 @@ class GDALTileInterface(object):
             return interface
 
     def _all_files(self):
-        return [f for f in listdir(self.tiles_folder) if isfile(join(self.tiles_folder, f)) and f.endswith(u'.tif')]
+        return [
+            os.path.relpath(join(root, f), self.tiles_folder)
+            for root, _, files in os.walk(self.tiles_folder)
+            for f in files
+            if f.endswith('.tif')
+        ]
 
     def has_summary_json(self):
         return os.path.exists(self.summary_file)
