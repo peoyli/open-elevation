@@ -6,7 +6,7 @@ You can freely host your own instance of Open-Elevation. There are two main opti
 First things first, clone the repository and `cd` onto its directory
 
 ```
-git clone http://github.com/Jorl17/open-elevation
+git clone http://github.com/peoyli/open-elevation
 cd open-elevation
 ```
 
