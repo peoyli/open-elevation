@@ -1,6 +1,7 @@
 import configparser
 import json
 import os
+from typing import Union
 
 from bottle import route, run, request, response, hook
 from gdal_interfaces import GDALTileInterface
@@ -73,19 +74,127 @@ def enable_cors():
     response.headers['Access-Control-Allow-Methods'] = 'PUT, GET, POST, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Origin, Accept, Content-Type, X-Requested-With, X-CSRF-Token'
 
-
-def lat_lng_from_location(location_with_comma):
+def dms_to_decimal(coord: Union[str, float], typ: str = "lat") -> float:
     """
-    Parse the latitude and longitude of a location in the format "xx.xxx,yy.yyy" (which we accept as a query string)
-    :param location_with_comma:
-    :return:
+    Convert a coordinate given as DMS **or** decimal to decimal degrees.
+
+    DMS format: [degrees][minutes][seconds].[fractional_seconds][N/S/E/W]
+    - Latitude: DDMMSS.fffN / DDMMSS.fffS (max 6 digits before decimal)
+    - Longitude: DDDMMSS.fffE / DDDMMSS.fffW (max 7 digits before decimal)
+
+    Returns float in decimal degrees.
+    """
+    # Fast-path for float
+    if isinstance(coord, float):
+        return coord
+
+    s = str(coord).strip()
+    if not s:
+        raise ValueError("Empty coordinate")
+
+    # Detect DMS by trailing direction letter
+    direction = s[-1].upper()
+    if direction in {"N", "S", "E", "W"}:
+        numeric_part = s[:-1].strip()
+        if not numeric_part:
+            raise ValueError("Missing numeric part for DMS coordinate")
+
+        # Split integer and fractional parts
+        if "." in numeric_part:
+            int_part, frac_part = numeric_part.split(".", 1)
+        else:
+            int_part, frac_part = numeric_part, ""
+
+        # Validate that all characters are digits
+        if not int_part.isdigit():
+            raise ValueError(f"Invalid numeric characters in DMS coordinate: {s}")
+
+        # Determine maximum degrees based on type
+        max_deg_len = 2 if typ == "lat" else 3
+        min_deg_len = 1
+
+        # Parse DMS: first 1-2 (lat) or 1-3 (lon) digits = degrees, next 2 = minutes, rest = seconds
+        for deg_len in range(max_deg_len, min_deg_len - 1, -1):
+            if len(int_part) < deg_len:
+                continue
+
+            deg = int(int_part[:deg_len])
+            remaining = int_part[deg_len:]
+
+            # Must have exactly 2 digits for minutes
+            if len(remaining) < 2:
+                continue
+
+            min_val = int(remaining[:2])
+            sec_str = remaining[2:]  # Everything after minutes
+
+            # Validate minutes
+            if min_val > 59:
+                continue
+
+            # Combine seconds integer part with fractional part
+            if sec_str and frac_part:
+                sec = float(f"{sec_str}.{frac_part}")
+            elif sec_str:
+                sec = float(sec_str)
+            elif frac_part:
+                sec = float(f"0.{frac_part}")
+            else:
+                sec = 0.0
+
+            # Calculate decimal degrees
+            decimal = abs(deg) + (min_val / 60.0) + (sec / 3600.0)
+
+            # Apply direction sign
+            if direction in {"S", "W"}:
+                decimal = -decimal
+
+            return decimal
+
+        # If we get here, try treating as simple degrees (no minutes/seconds)
+        try:
+            deg = float(numeric_part)
+            if direction in {"S", "W"}:
+                deg = -deg
+            return deg
+        except ValueError:
+            pass
+
+        # Final fallback: treat as decimal with direction
+        try:
+            return float(numeric_part) * (1 if direction in {"N", "E"} else -1)
+        except ValueError:
+            raise ValueError(f"Could not parse DMS coordinate: {s}")
+    else:
+        # Plain decimal
+        try:
+            return float(s)
+        except ValueError:
+            raise ValueError(f"Invalid decimal coordinate: {s!r}")
+
+def lat_lng_from_location(location_with_comma: str):
+    """
+    Parse latitude and longitude from comma-separated string.
+
+    Each coordinate may be:
+    - Decimal: "67.945528"
+    - DMS: "675643.9N" (degrees + minutes + seconds + direction)
     """
     try:
-        lat, lng = [float(i) for i in location_with_comma.split(',')]
-        return lat, lng
-    except:
-        raise InternalException(json.dumps({'error': 'Bad parameter format "%s".' % location_with_comma}))
+        parts = [p.strip() for p in location_with_comma.split(',')]
+        if len(parts) != 2:
+            raise ValueError("Expected exactly two comma-separated values")
 
+        lat = dms_to_decimal(parts[0], "lat")
+        lng = dms_to_decimal(parts[1], "lon")
+
+        return float(lat), float(lng)
+    except (ValueError, TypeError) as exc:
+        raise InternalException(
+            json.dumps({
+                "error": f'Bad parameter format "{location_with_comma}". Detail: {exc}'
+            })
+        )
 
 def query_to_locations():
     """
