@@ -6,9 +6,10 @@ from os.path import isfile, join, getsize
 import json
 from rtree import index
 
-# Originally based on https://stackoverflow.com/questions/13439357/extract-point-from-raster-in-gdal
 class GDALInterface(object):
     SEA_LEVEL = 0
+    NO_DATA_VALUE = -9999  # Sentinel for missing/no data
+
     def __init__(self, tif_path):
         super(GDALInterface, self).__init__()
         self.tif_path = tif_path
@@ -44,8 +45,6 @@ class GDALInterface(object):
         self.geo_transform_inv = (gt[0], gt[5] / dev, -gt[2] / dev,
                                   gt[3], -gt[4] / dev, gt[1] / dev)
 
-
-
     @lazy
     def points_array(self):
         b = self.src.GetRasterBand(1)
@@ -54,13 +53,10 @@ class GDALInterface(object):
     def print_statistics(self):
         print(self.src.GetRasterBand(1).GetStatistics(True, True))
 
-
     def lookup(self, lat, lon):
         try:
-
             # get coordinate of the raster
             xgeo, ygeo, zgeo = self.coordinate_transform.TransformPoint(lon, lat, 0)
-
             # convert it to pixel/line on band
             u = xgeo - self.geo_transform_inv[0]
             v = ygeo - self.geo_transform_inv[3]
@@ -68,13 +64,35 @@ class GDALInterface(object):
             xpix = int(self.geo_transform_inv[1] * u + self.geo_transform_inv[2] * v)
             ylin = int(self.geo_transform_inv[4] * u + self.geo_transform_inv[5] * v)
 
+            # Check bounds before accessing array
+            if (xpix < 0 or ylin < 0 or
+                xpix >= self.src.RasterXSize or
+                ylin >= self.src.RasterYSize):
+                return self.NO_DATA_VALUE
+
             # look the value up
             v = self.points_array[ylin, xpix]
 
+            # Handle no-data scenarios
+            if v is None:
+                return self.NO_DATA_VALUE
+
+            # Convert numpy types to Python int (fix for JSON serialization)
+            if hasattr(v, 'item'):  # numpy scalar
+                v = v.item()
+            else:
+                v = int(v)  # Ensure it's a regular Python int
+
+            # Check for common no-data values
+            no_data_values = [-32768, -9999, -99999, 32767, 65535]
+            if v in no_data_values or v < -10000 or v > 90000:  # Unrealistic values
+                return self.NO_DATA_VALUE
+
             return v if v != -32768 else self.SEA_LEVEL
+
         except Exception as e:
             print(e)
-            return self.SEA_LEVEL
+            return self.NO_DATA_VALUE  # Changed from SEA_LEVEL
 
     def close(self):
         self.src = None
@@ -86,6 +104,8 @@ class GDALInterface(object):
         self.close()
 
 class GDALTileInterface(object):
+    NO_DATA_VALUE = -9999  # Sentinel for missing/no data
+
     def __init__(self, tiles_folder, summary_file, open_interfaces_size=5):
         super(GDALTileInterface, self).__init__()
         self.tiles_folder = tiles_folder
@@ -100,10 +120,8 @@ class GDALTileInterface(object):
             interface = self.cached_open_interfaces_dict[path]
             self.cached_open_interfaces.remove(path)
             self.cached_open_interfaces += [path]
-
             return interface
         else:
-
             interface = GDALInterface(path)
             self.cached_open_interfaces += [path]
             self.cached_open_interfaces_dict[path] = interface
@@ -112,7 +130,6 @@ class GDALTileInterface(object):
                 last_interface_path = self.cached_open_interfaces.pop(0)
                 last_interface = self.cached_open_interfaces_dict[last_interface_path]
                 last_interface.close()
-
                 self.cached_open_interfaces_dict[last_interface_path] = None
                 del self.cached_open_interfaces_dict[last_interface_path]
 
@@ -166,15 +183,23 @@ class GDALTileInterface(object):
         self._build_index()
 
     def lookup(self, lat, lng):
-        nearest = list(self.index.nearest((lat, lng), 1, objects=True))
+        """Enhanced lookup that handles no-data internally"""
+        try:
+            nearest = list(self.index.nearest((lat, lng), 1, objects=True))
+            if not nearest:
+                return self.NO_DATA_VALUE
 
-        if not nearest:
-            raise Exception('Invalid latitude/longitude')
-        else:
             coords = nearest[0].object
-
             gdal_interface = self._open_gdal_interface(coords['file'])
-            return int(gdal_interface.lookup(lat, lng))
+            elevation = gdal_interface.lookup(lat, lng)
+
+            # GDALInterface.lookup() already returns NO_DATA_VALUE for bad data
+            # We just pass it through unchanged
+            return elevation
+
+        except Exception as e:
+            print(f"Lookup error for ({lat}, {lng}): {e}")
+            return self.NO_DATA_VALUE
 
     def _build_index(self):
         print('Building spatial index ...')

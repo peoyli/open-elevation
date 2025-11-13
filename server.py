@@ -6,7 +6,6 @@ from typing import Union
 from bottle import route, run, request, response, hook
 from gdal_interfaces import GDALTileInterface
 
-
 class InternalException(ValueError):
     """
     Utility exception class to handle errors internally and return error codes to the client
@@ -50,19 +49,31 @@ def get_elevation(lat, lng):
     """
     try:
         elevation = interface.lookup(lat, lng)
-    except:
+
+        # Handle no-data scenarios
+        if elevation == interface.NO_DATA_VALUE:
+            return {
+                'latitude': lat,
+                'longitude': lng,
+                'elevation': None,
+                'status': 'no_data'
+            }
+        else:
+            return {
+                'latitude': lat,
+                'longitude': lng,
+                'elevation': elevation,
+                'status': 'ok'
+            }
+
+    except Exception as e:
+        print(f"Elevation lookup failed for ({lat}, {lng}): {e}")
         return {
             'latitude': lat,
             'longitude': lng,
-            'error': 'No such coordinate (%s, %s)' % (lat, lng)
+            'elevation': None,
+            'status': 'error'
         }
-
-    return {
-        'latitude': lat,
-        'longitude': lng,
-        'elevation': elevation
-    }
-
 
 @hook('after_request')
 def enable_cors():
@@ -230,7 +241,6 @@ def body_to_locations():
 
     return latlng
 
-
 def do_lookup(get_locations_func):
     """
     Generic method which gets the locations in [(lat,lng),(lat,lng),...] format by calling get_locations_func
@@ -257,7 +267,6 @@ def get_lookup():
     :return:
     """
     return do_lookup(query_to_locations)
-
 
 @route(URL_ENDPOINT, method=['POST'])
 def post_lookup():
