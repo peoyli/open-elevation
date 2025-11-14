@@ -139,7 +139,7 @@ class GDALTileInterface(object):
     def _all_files(self):
         return [
             os.path.relpath(join(root, f), self.tiles_folder)
-            for root, _, files in os.walk(self.tiles_folder)
+            for root, _, files in os.walk(self.tiles_folder, followlinks=True)
             for f in files
             if f.endswith('.tif')
         ]
