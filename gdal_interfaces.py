@@ -9,6 +9,7 @@ from rtree import index
 class GDALInterface(object):
     SEA_LEVEL = 0
     NO_DATA_VALUE = -9999  # Sentinel for missing/no data
+    gdal.UseExceptions()
 
     def __init__(self, tif_path):
         super(GDALInterface, self).__init__()
