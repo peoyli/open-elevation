@@ -4,7 +4,12 @@ from lazy import lazy
 from os import listdir
 from os.path import isfile, join, getsize
 import json
+import logging
 from rtree import index
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+  format='%(asctime)s %(levelname)s: %(message)s',datefmt='[%Y-%m-%d %I:%M:%S %z]')
 
 class GDALInterface(object):
     SEA_LEVEL = 0
@@ -168,7 +173,7 @@ class GDALTileInterface(object):
                                 )
                 }
             ]
-            print('\tDone! LAT (%s,%s) | LNG (%s,%s)' % (lmin, lmax, lngmin, lngmax))
+            print('Done! LAT (%s,%s) | LNG (%s,%s)\n' % (lmin, lmax, lngmin, lngmax))
 
         with open(self.summary_file, 'w') as f:
             json.dump(all_coords, f)
@@ -209,3 +214,157 @@ class GDALTileInterface(object):
             e['index_id'] = index_id
             left, bottom, right, top = (e['coords'][0], e['coords'][2], e['coords'][1], e['coords'][3])
             self.index.insert( index_id, (left, bottom, right, top), obj=e)
+
+class GDALPriorityTileInterface(GDALTileInterface):
+    """Extends GDALTileInterface with priority-based source selection."""
+
+    def __init__(self, data_folder, summary_file, open_interfaces_size=5):
+        super().__init__(data_folder, summary_file, open_interfaces_size)
+        self.source_info = {}  # Maps source IDs to source priority info
+
+    def _get_source_info(self, filepath):
+        """Extract source priority information from filepath."""
+        # Default to lowest priority if no metadata
+        default_priority = 9999
+        default_name = "default"
+        default_resolution = 2000
+
+        # Check if we already computed this source
+        for source_dir, info in self.source_info.items():
+            if filepath.startswith(source_dir):
+                return info
+
+        # Determine source directory for this file
+        source_dir = filepath
+        while source_dir != self.tiles_folder:
+            source_dir = os.path.dirname(source_dir)
+            metadata_file = os.path.join(source_dir, 'metadata.json')
+
+            if os.path.exists(metadata_file):
+                try:
+                    with open(metadata_file, 'r') as f:
+                        metadata = json.load(f)
+
+                    priority = metadata.get('priority', default_priority)
+                    name = metadata.get('name', os.path.basename(source_dir))
+                    resolution = metadata.get('resolution', default_resolution)
+
+                    # Store for reuse
+                    info = {'priority': priority, 'name': name, 'resolution': resolution}
+                    self.source_info[source_dir] = info
+                    return info
+                except Exception as e:
+                    print(f"Error reading metadata from {metadata_file}: {e}")
+
+        # No metadata found, use defaults
+        info = {'priority': default_priority, 'name': default_name, 'resolution': default_resolution}
+        self.source_info[self.tiles_folder] = info  # Store for reuse
+        return info
+
+    def create_summary_json(self):
+        """Create summary JSON with source priority information."""
+        all_coords = []
+        for file in self._all_files():
+            full_path = join(self.tiles_folder,file)
+            print('Processing %s ... (%s MB)' % (full_path, getsize(full_path) / 2**20))
+            i = self._open_gdal_interface(full_path)
+            coords = i.get_corner_coords()
+            lmin, lmax = coords['BOTTOM_RIGHT'][1], coords['TOP_RIGHT'][1]
+            lngmin, lngmax = coords['TOP_LEFT'][0], coords['TOP_RIGHT'][0]
+
+            # Get both priority AND resolution from metadata
+            #priority = self._get_file_priority(full_path)
+            #resolution = self._get_file_resolution(full_path)
+
+            # Get source priority information
+            source_info = self._get_source_info(full_path)
+            name = source_info['name']
+            priority = source_info['priority']
+            resolution = source_info['resolution']
+
+            all_coords += [{
+                'file': full_path,
+                'coords': (lmin, lmax, lngmin, lngmax),
+                'source_name': name,
+                'priority': priority,
+                'resolution': resolution
+            }]
+            print('Done! LAT (%s,%s) | LNG (%s,%s) | Priority: %s | Resolution: %sm\n' % (lmin, lmax, lngmin, lngmax, priority, resolution))
+
+        with open(self.summary_file, 'w') as f:
+            json.dump(all_coords, f)
+
+        self.all_coords = all_coords
+        self._build_index()
+
+    def read_summary_json(self):
+        """Read summary JSON with source priority information."""
+        with open(self.summary_file) as f:
+            self.all_coords = json.load(f)
+
+        # Load source information from summary entries
+        for entry in self.all_coords:
+            source_dir = os.path.dirname(entry['file'])
+            self.source_info[source_dir] = {
+                'priority': entry['priority'],
+                'name': entry['source_name'],
+                'resolution': entry['resolution']
+            }
+        self._build_index()
+
+    def lookup(self, lat, lng):
+        """Enhanced lookup with priority-based source selection."""
+        logging.info(f"Looking up elevation for ({lat:.6f}, {lng:.6f})")
+        try:
+            # Use a precise bounding box to find only tiles that actually contain this point
+            # Expand by a tiny epsilon to catch tiles that exactly touch this coordinate
+            epsilon = 0.0001  # About 10 meters
+            bbox = (lat - epsilon, lng - epsilon, lat + epsilon, lng + epsilon)
+
+            # Find tiles that contain this coordinate
+            candidates = list(self.index.intersection(bbox, objects=True))
+
+            if not candidates:
+                logging.info(f"No tiles found for coordinate ({lat:.6f}, {lng:.6f})")
+                return self.NO_DATA_VALUE
+
+            logging.info(f"Found {len(candidates)} candidate tiles")
+
+            # Try candidates in priority order, then by resolution (lower number = higher priority/resolution)
+            sorted_candidates = sorted(candidates, key=lambda x: (x.object.get('priority', 9999), x.object.get('resolution', 3000)))
+            for i, candidate in enumerate(sorted_candidates):
+                tile_info = candidate.object
+                logging.info(
+                  f"  {i+1}. Tile: {os.path.basename(tile_info['file'])} "
+                  f"(priority: {tile_info['priority']}, "
+                  f"resolution: {tile_info['resolution']}m)"
+                )
+
+            logging.info("Trying in priority order:")
+            for i, candidate in enumerate(sorted_candidates):
+                tile_info = candidate.object
+                gdal_interface = self._open_gdal_interface(tile_info['file'])
+                logging.info(
+                  f"  {i+1}. Trying {os.path.basename(tile_info['file'])} "
+                  f"(priority: {tile_info['priority']}, "
+                  f"resolution: {tile_info['resolution']}m)"
+                )
+
+                try:
+                    elevation = gdal_interface.lookup(lat, lng)
+                    if elevation != self.NO_DATA_VALUE:
+                        logging.info(f"    ✓ Success! Elevation: {elevation}m")
+                        return elevation
+                    else:
+                        logging.info(f"    ✗ No data in this tile, trying next...")
+                except Exception as e:
+                    logging.error(f"    ✗ Error in tile: {e}")
+                    continue
+            logging.warning(
+              f"No elevation data found for ({lat:.6f}, {lng:.6f}) "
+              f"in any source (tried {len(candidates)} tiles)"
+            )
+            return self.NO_DATA_VALUE
+        except Exception as e:
+            print(f"Lookup error for ({lat}, {lng}): {e}")
+            return self.NO_DATA_VALUE
