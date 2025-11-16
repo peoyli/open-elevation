@@ -6,10 +6,21 @@ from os.path import isfile, join, getsize
 import json
 import logging
 from rtree import index
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO,
   format='%(asctime)s %(levelname)s: %(message)s',datefmt='[%Y-%m-%d %I:%M:%S %z]')
+
+def age_in_months(date_str):
+    try:
+        date = datetime.strptime(date_str, "%Y-%m-%d")
+        now = datetime.today()
+        delta_days = (now - date).days
+        return round(delta_days / 30.4375)
+    except (ValueError, TypeError):
+        # Return None on malformed date
+        return None
 
 class GDALInterface(object):
     SEA_LEVEL = 0
@@ -251,6 +262,12 @@ class GDALPriorityTileInterface(GDALTileInterface):
 
                     # Store for reuse
                     info = {'priority': priority, 'name': name, 'resolution': resolution}
+
+                    if 'date' in metadata:
+                        info['date'] = metadata.get('date')
+                    if 'dynamic_priority' in metadata:
+                        info['dynamic_priority'] = metadata.get('dynamic_priority')
+
                     self.source_info[source_dir] = info
                     return info
                 except Exception as e:
@@ -287,7 +304,9 @@ class GDALPriorityTileInterface(GDALTileInterface):
                 'coords': (lmin, lmax, lngmin, lngmax),
                 'source_name': name,
                 'priority': priority,
-                'resolution': resolution
+                'resolution': resolution,
+                'date': source_info.get('date'),
+                'dynamic_priority': source_info.get('dynamic_priority')
             }]
             print('Done! LAT (%s,%s) | LNG (%s,%s) | Priority: %s | Resolution: %sm\n' % (lmin, lmax, lngmin, lngmax, priority, resolution))
 
@@ -329,9 +348,49 @@ class GDALPriorityTileInterface(GDALTileInterface):
                 return self.NO_DATA_VALUE
 
             logging.info(f"Found {len(candidates)} candidate tiles")
+            for i, candidate in enumerate(candidates):
+                tile_info = candidate.object
+                logging.info(
+                  f"  {i+1}. Tile: {os.path.basename(tile_info['file'])} "
+                  f"(priority: {tile_info['priority']}, "
+                  f"resolution: {tile_info['resolution']}m)"
+                )
 
-            # Try candidates in priority order, then by resolution (lower number = higher priority/resolution)
+            # Optimization: If only one candidate, use it directly
+            if len(candidates) == 1:
+                gdal_interface = self._open_gdal_interface(candidates[0].object['file'])
+                elevation = gdal_interface.lookup(lat, lng)
+                if elevation != self.NO_DATA_VALUE:
+                    logging.info(f"  → Single candidate elevation: {elevation}m")
+                    return elevation
+                else:
+                    return self.NO_DATA_VALUE
+
+            # Check if ANY candidate has dynamic_priority
+            has_dynamic = any('dynamic_priority' in candidate.object for candidate in candidates)
+
+            if has_dynamic:
+                # Calculate dynamic priorities only for those that need it
+                for candidate in candidates:
+                    if 'dynamic_priority' in candidate.object:
+                        tile_info = candidate.object
+                        adjusted_priority = self._calculate_dynamic_priority(tile_info)
+                        tile_info['priority'] = adjusted_priority
+
+                # Show adjusted candidates
+                logging.info("Priority-adjusted candidates:")
+                for i, candidate in enumerate(candidates):
+                    tile_info = candidate.object
+                    logging.info(
+                      f"  {i+1}. Tile: {os.path.basename(tile_info['file'])} "
+                      f"(priority: {tile_info['priority']}, "
+                      f"resolution: {tile_info['resolution']}m)"
+                    )
+
+            # Sort the candidates in priority order, then by resolution (lower number = higher priority)
+            # resolution is only important when two candidates have the same priority
             sorted_candidates = sorted(candidates, key=lambda x: (x.object.get('priority', 9999), x.object.get('resolution', 3000)))
+            logging.info("Candidates sorted by priority:")
             for i, candidate in enumerate(sorted_candidates):
                 tile_info = candidate.object
                 logging.info(
@@ -340,6 +399,7 @@ class GDALPriorityTileInterface(GDALTileInterface):
                   f"resolution: {tile_info['resolution']}m)"
                 )
 
+            # Try candidates in priority order, done when a value is returned
             logging.info("Trying in priority order:")
             for i, candidate in enumerate(sorted_candidates):
                 tile_info = candidate.object
@@ -368,3 +428,40 @@ class GDALPriorityTileInterface(GDALTileInterface):
         except Exception as e:
             print(f"Lookup error for ({lat}, {lng}): {e}")
             return self.NO_DATA_VALUE
+
+    def _calculate_dynamic_priority(self, tile_info):
+        logging.info(f"## Adjusting priority for {tile_info['source_name']} ##")
+        # Get the starting priority directly from the tile information
+        starting_priority = tile_info['priority']
+
+        # Check if dynamic_priority exists, if not, return the starting priority without changes
+        if "dynamic_priority" not in tile_info:
+            logging.info(f"dynamic_priority not set, return original value")
+            return starting_priority
+
+        # Extract dynamic_priority if it exists
+        dynamic_priority = tile_info.get("dynamic_priority")
+
+        logging.debug(f"Initial priority: {tile_info['priority']}")
+        logging.debug(f"- Resolution adjustment: 1000-resolution = {1000 - tile_info['resolution']}")
+
+        # Handle missing date: if there's no 'date', we can either set age to 0 or skip it.
+        if 'date' in tile_info:
+            dataset_age = age_in_months(tile_info['date'])
+            if dataset_age is None:
+                logging.warn(f"Error: Invalid date format '{tile_info['date']}' for {tile_info['source_name']}. Using default age.")
+                dataset_age = 360  # Default to 30 years (360 months)
+                tile_info['date'] = "Invalid date"
+        else:
+            dataset_age = 360  # If no date, set age to 0 months (or you can choose another default value)
+            tile_info['date'] = "No date"
+
+        # Apply the dynamic priority formula
+        # The formula for decreasing calculated priority with increasing resolution:
+        #priority = starting_priority - (1000 - dataset['resolution']) + dataset_age - dynamic_priority
+        priority = starting_priority - (1000 - tile_info['resolution']) - (360 - dataset_age) - dynamic_priority
+
+        logging.debug(f"- Adjustment (dynamic): {dynamic_priority}")
+        logging.debug(f"- Age adjustment: 360-age = {360 - dataset_age}")
+        logging.debug(f"= {priority}")
+        return priority
