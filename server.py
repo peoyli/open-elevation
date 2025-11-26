@@ -7,8 +7,8 @@ from typing import Union
 from bottle import route, run, request, response, hook
 from gdal_interfaces import GDALTileInterface
 
-logging.basicConfig(level=logging.INFO,
-  format='%(asctime)s %(levelname)s: %(message)s',datefmt='[%Y-%m-%d %I:%M:%S %z]')
+logging.basicConfig(level=logging.DEBUG,
+  format='%(asctime)s %(levelname)s: %(message)s',datefmt='[%Y-%m-%d %H:%M:%S %z]')
 
 class InternalException(ValueError):
     """
