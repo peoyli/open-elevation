@@ -1,3 +1,4 @@
+import logging
 import configparser
 import json
 import os
@@ -5,6 +6,9 @@ from typing import Union
 
 from bottle import route, run, request, response, hook
 from gdal_interfaces import GDALTileInterface
+
+logging.basicConfig(level=logging.INFO,
+  format='%(asctime)s %(levelname)s: %(message)s',datefmt='[%Y-%m-%d %I:%M:%S %z]')
 
 class InternalException(ValueError):
     """
@@ -27,11 +31,56 @@ CERTS_FOLDER = parser.get('server', 'certs-folder')
 CERT_FILE = '%s/cert.crt' % CERTS_FOLDER
 KEY_FILE = '%s/cert.key' % CERTS_FOLDER
 
+def test_priority_system():
+    """Temporary test to verify the priority system works"""
+    try:
+        print("\n=== Pre-launch test ===")
 
-"""
-Initialize a global interface. This can grow quite large, because it has a cache.
-"""
-interface = GDALTileInterface(DATA_FOLDER, '%s/summary.json' % DATA_FOLDER, OPEN_INTERFACES_SIZE)
+        # Test a coordinate that should exist in multiple sources
+        test_coords = [
+            (34.052235, -118.243683),  # LA - should use high-res if available
+            (40.7128, -74.0060),       # NYC
+            (0.0, 0.0),                # Gulf of Guinea - should use global fallback
+            (67.945528,23.625417),     # Muoniovaara C
+            (64.707167,21.177583),     # Ursviken C
+            (64.70716666666667,21.17758333333333), # Ursviken C
+        ]
+
+        for lat, lng in test_coords:
+            logging.info(f"== Got request for ({lat:.6f}, {lng:.6f}) ==")
+            #print(f"\nTesting ({lat}, {lng}):")
+            try:
+                result = interface.lookup(lat, lng)
+                if result == interface.NO_DATA_VALUE:
+                    logging.info(f"Testing ({lat:.6f}, {lng:.6f}) → No data found")
+                    #print(f"  → No data found")
+                else:
+                    logging.info(f"Testing ({lat:.6f}, {lng:.6f}) → Elevation: {result}m")
+                    #print(f"  → Elevation: {result}m")
+            except Exception as e:
+                print(f"  → Error: {e}")
+
+        print("=== Test Complete ===\n")
+
+    except Exception as e:
+        print(f"Priority system test failed: {e}")
+
+# Check if we should use priority mode (if any metadata.json files exist)
+def check_for_priority_mode():
+    """Check if any metadata.json files exist in the data folder."""
+    for root, _, files in os.walk(DATA_FOLDER, followlinks=True):
+        if 'metadata.json' in files:
+            return True
+    return False
+
+# Determine which interface to use
+if check_for_priority_mode():
+    print('Using priority-based multi-source interface')
+    from gdal_interfaces import GDALPriorityTileInterface
+    interface = GDALPriorityTileInterface(DATA_FOLDER, f'{DATA_FOLDER}/summary.json', OPEN_INTERFACES_SIZE)
+else:
+    print('Using standard single-source interface')
+    interface = GDALTileInterface(DATA_FOLDER, f'{DATA_FOLDER}/summary.json', OPEN_INTERFACES_SIZE)
 
 if interface.has_summary_json() and not ALWAYS_REBUILD_SUMMARY:
     print('Re-using existing summary JSON')
@@ -39,6 +88,8 @@ if interface.has_summary_json() and not ALWAYS_REBUILD_SUMMARY:
 else:
     print('Creating summary JSON ...')
     interface.create_summary_json()
+
+test_priority_system()
 
 def get_elevation(lat, lng):
     """
